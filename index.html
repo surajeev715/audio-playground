@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Audio Playground</title>
+<style>
+  :root {
+    --bg: #f6f6f4;
+    --panel: #ffffff;
+    --text: #1d1d1f;
+    --muted: #6b6b70;
+    --border: #dcdcd8;
+    --accent: #2f6fde;
+    --peak: #e0703a;
+    --rms: #2f6fde;
+    --rec: #d33a3a;
+    --ok: #2e8b57;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161618;
+      --panel: #1f1f22;
+      --text: #ececee;
+      --muted: #9a9aa2;
+      --border: #333338;
+      --accent: #6b9cff;
+      --peak: #ff9a5c;
+      --rms: #6b9cff;
+      --rec: #ff6b6b;
+      --ok: #5cc98a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 16px;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p.lead { margin: 0 0 16px; color: var(--muted); }
+  section {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px;
+    margin-bottom: 12px;
+  }
+  label.field { display: block; font-weight: 600; margin-bottom: 6px; }
+  input[type=text] {
+    width: 100%;
+    padding: 9px 10px;
+    font: inherit;
+    color: var(--text);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  button {
+    font: inherit;
+    font-weight: 600;
+    padding: 10px 14px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; }
+  .labels button { flex: 1 1 120px; }
+  .status { font-size: 13px; color: var(--muted); margin-top: 8px; word-break: break-word; }
+  .status.ok { color: var(--ok); }
+  .status.warn { color: var(--rec); }
+  .recording { color: var(--rec); font-weight: 700; min-height: 22px; margin-top: 8px; }
+  canvas { width: 100%; height: 200px; display: block; }
+  .legend { display: flex; gap: 14px; font-size: 13px; color: var(--muted); margin-top: 6px; }
+  .legend span::before {
+    content: ""; display: inline-block; width: 10px; height: 10px;
+    border-radius: 2px; margin-right: 6px; vertical-align: -1px;
+  }
+  .legend .l-peak::before { background: var(--peak); }
+  .legend .l-rms::before { background: var(--rms); }
+  .numbers { font-variant-numeric: tabular-nums; font-size: 13px; color: var(--muted); margin-top: 4px; }
+  ul.segments { margin: 8px 0 0; padding-left: 18px; font-size: 13px; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Audio Playground</h1>
+  <p class="lead">Records microphone levels without gaps, labeled by what you did. Download the CSV and plot it with <code>plot.py</code>.</p>
+
+  <section>
+    <label class="field" for="device">Device name</label>
+    <input id="device" type="text" placeholder="e.g. tablet, laptop, mom-phone" autocomplete="off">
+    <div class="row" style="margin-top:10px">
+      <button id="startMic" class="primary">Start microphone</button>
+    </div>
+    <div id="micStatus" class="status">Microphone not started.</div>
+  </section>
+
+  <section>
+    <label class="field">Record a 5 second segment</label>
+    <div class="row labels">
+      <button data-label="silence" disabled>Silence</button>
+      <button data-label="clap" disabled>Clap</button>
+      <button data-label="blow" disabled>Blow</button>
+      <button data-label="talk" disabled>Talk</button>
+    </div>
+    <div id="recording" class="recording"></div>
+  </section>
+
+  <section>
+    <canvas id="chart"></canvas>
+    <div class="legend"><span class="l-peak">Peak</span><span class="l-rms">RMS</span></div>
+    <div id="numbers" class="numbers"></div>
+  </section>
+
+  <section>
+    <div class="row">
+      <button id="download" disabled>Download CSV</button>
+      <button id="undo" disabled>Undo last segment</button>
+      <button id="clear" disabled>Clear all</button>
+    </div>
+    <ul id="segments" class="segments"></ul>
+  </section>
+</main>
+
+<script>
+// ---------- Settings ----------
+const SEGMENT_SECONDS = 5;     // length of one labeled recording
+const BLOCK_SECONDS = 0.01;    // one measurement every 10 ms, gap-free
+const CHART_SECONDS = 5;       // how much history the live chart shows
+
+// ---------- AudioWorklet: runs on the audio thread and sees every sample ----------
+// It sums up blocks of samples and sends peak and RMS of each block to the page.
+const workletCode = `
+class LevelProcessor extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    this.blockSize = options.processorOptions.blockSize;
+    this.count = 0;
+    this.peak = 0;
+    this.sumOfSquares = 0;
+  }
+  process(inputs) {
+    const channel = inputs[0] && inputs[0][0];
+    if (channel) {
+      for (let i = 0; i < channel.length; i++) {
+        const s = channel[i];
+        const a = Math.abs(s);
+        if (a > this.peak) this.peak = a;
+        this.sumOfSquares += s * s;
+        this.count++;
+        if (this.count >= this.blockSize) {
+          this.port.postMessage({ peak: this.peak, rms: Math.sqrt(this.sumOfSquares / this.count) });
+          this.count = 0;
+          this.peak = 0;
+          this.sumOfSquares = 0;
+        }
+      }
+    }
+    return true;
+  }
+}
+registerProcessor("level-processor", LevelProcessor);
+`;
+
+// ---------- State ----------
+const deviceInput = document.getElementById("device");
+const micStatus = document.getElementById("micStatus");
+const recordingText = document.getElementById("recording");
+const numbersText = document.getElementById("numbers");
+const segmentList = document.getElementById("segments");
+const labelButtons = [...document.querySelectorAll(".labels button")];
+const downloadButton = document.getElementById("download");
+const undoButton = document.getElementById("undo");
+const clearButton = document.getElementById("clear");
+const canvas = document.getElementById("chart");
+
+let audioContext = null;
+let blockMs = BLOCK_SECONDS * 1000;
+let history = [];             // recent blocks for the chart: { peak, rms }
+let rows = [];                // all recorded rows for the CSV
+let segments = [];            // summary of each recorded segment
+let segmentCounter = 0;
+let recording = null;         // { label, segment, blocksLeft, blockIndex }
+
+// ---------- Microphone ----------
+document.getElementById("startMic").addEventListener("click", startMicrophone);
+
+async function startMicrophone() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setMicStatus("This browser does not allow microphone access here. Open the page over https or localhost.", "warn");
+    return;
+  }
+
+  try {
+    // Browser processing off, it would soften or remove claps.
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+      video: false
+    });
+
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    const blockSize = Math.round(audioContext.sampleRate * BLOCK_SECONDS);
+    blockMs = (blockSize / audioContext.sampleRate) * 1000;
+
+    const workletUrl = URL.createObjectURL(new Blob([workletCode], { type: "application/javascript" }));
+    await audioContext.audioWorklet.addModule(workletUrl);
+
+    const source = audioContext.createMediaStreamSource(stream);
+    const levelNode = new AudioWorkletNode(audioContext, "level-processor", {
+      processorOptions: { blockSize }
+    });
+    levelNode.port.onmessage = (event) => onBlock(event.data);
+
+    // A silent output keeps the audio graph running in every browser.
+    const mute = audioContext.createGain();
+    mute.gain.value = 0;
+    source.connect(levelNode);
+    levelNode.connect(mute);
+    mute.connect(audioContext.destination);
+
+    await audioContext.resume();
+
+    // Show what the browser actually applied. Some browsers ignore the "off" requests.
+    const settings = stream.getAudioTracks()[0].getSettings();
+    const processingOff = settings.echoCancellation === false
+      && settings.noiseSuppression === false
+      && settings.autoGainControl === false;
+    setMicStatus(
+      `Running at ${audioContext.sampleRate} Hz, one measurement every ${blockMs.toFixed(1)} ms. ` +
+      `Echo cancellation: ${settings.echoCancellation}, noise suppression: ${settings.noiseSuppression}, ` +
+      `auto gain: ${settings.autoGainControl}.` +
+      (processingOff ? "" : " Warning: the browser kept some processing on."),
+      processingOff ? "ok" : "warn"
+    );
+
+    document.getElementById("startMic").disabled = true;
+    updateButtons();
+    requestAnimationFrame(drawChart);
+  } catch (error) {
+    setMicStatus("Could not start the microphone: " + error, "warn");
+  }
+}
+
+function setMicStatus(text, kind) {
+  micStatus.textContent = text;
+  micStatus.className = "status" + (kind ? " " + kind : "");
+}
+
+// ---------- Every block (10 ms) ----------
+function onBlock(block) {
+  history.push(block);
+  const maxBlocks = Math.ceil((CHART_SECONDS * 1000) / blockMs);
+  if (history.length > maxBlocks) history.splice(0, history.length - maxBlocks);
+
+  if (recording) {
+    rows.push({
+      device: deviceName(),
+      label: recording.label,
+      segment: recording.segment,
+      time_ms: recording.blockIndex * blockMs,
+      peak: block.peak,
+      rms: block.rms
+    });
+    recording.blockIndex++;
+    recording.maxPeak = Math.max(recording.maxPeak, block.peak);
+    recording.maxRms = Math.max(recording.maxRms, block.rms);
+    recording.blocksLeft--;
+    if (recording.blocksLeft <= 0) finishRecording();
+  }
+}
+
+// ---------- Labeled recording ----------
+labelButtons.forEach((button) => {
+  button.addEventListener("click", () => startRecording(button.dataset.label));
+});
+
+function startRecording(label) {
+  if (!deviceName()) {
+    deviceInput.focus();
+    recordingText.textContent = "Enter a device name first.";
+    return;
+  }
+  segmentCounter++;
+  recording = {
+    label,
+    segment: segmentCounter,
+    blocksLeft: Math.round((SEGMENT_SECONDS * 1000) / blockMs),
+    blockIndex: 0,
+    maxPeak: 0,
+    maxRms: 0
+  };
+  updateButtons();
+}
+
+function finishRecording() {
+  segments.push({
+    segment: recording.segment,
+    label: recording.label,
+    maxPeak: recording.maxPeak,
+    maxRms: recording.maxRms
+  });
+  recording = null;
+  recordingText.textContent = "";
+  renderSegments();
+  updateButtons();
+}
+
+function renderSegments() {
+  segmentList.innerHTML = "";
+  segments.forEach((s) => {
+    const item = document.createElement("li");
+    item.textContent = `#${s.segment} ${s.label}: max peak ${s.maxPeak.toFixed(3)}, max RMS ${s.maxRms.toFixed(4)}`;
+    segmentList.appendChild(item);
+  });
+}
+
+function updateButtons() {
+  const micReady = audioContext !== null;
+  const busy = recording !== null;
+  labelButtons.forEach((b) => (b.disabled = !micReady || busy));
+  downloadButton.disabled = busy || rows.length === 0;
+  undoButton.disabled = busy || segments.length === 0;
+  clearButton.disabled = busy || rows.length === 0;
+}
+
+// ---------- Undo, clear, download ----------
+undoButton.addEventListener("click", () => {
+  const last = segments.pop();
+  if (!last) return;
+  rows = rows.filter((r) => r.segment !== last.segment);
+  renderSegments();
+  updateButtons();
+});
+
+clearButton.addEventListener("click", () => {
+  if (!confirm("Delete all recorded segments?")) return;
+  rows = [];
+  segments = [];
+  segmentCounter = 0;
+  renderSegments();
+  updateButtons();
+});
+
+downloadButton.addEventListener("click", () => {
+  const header = "device,label,segment,time_ms,peak,rms";
+  const lines = rows.map((r) =>
+    [r.device, r.label, r.segment, r.time_ms.toFixed(2), r.peak.toFixed(6), r.rms.toFixed(6)].join(",")
+  );
+  const csv = [header, ...lines].join("\n");
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+  link.download = `${deviceName()}.csv`;
+  link.click();
+  URL.revokeObjectURL(link.href);
+});
+
+// Device names end up in file names and CSV rows, so only simple characters are kept.
+function deviceName() {
+  return deviceInput.value.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+// ---------- Live chart ----------
+function drawChart() {
+  const ratio = window.devicePixelRatio || 1;
+  const width = canvas.clientWidth;
+  const height = canvas.clientHeight;
+  if (canvas.width !== width * ratio || canvas.height !== height * ratio) {
+    canvas.width = width * ratio;
+    canvas.height = height * ratio;
+  }
+  const g = canvas.getContext("2d");
+  g.setTransform(ratio, 0, 0, ratio, 0, 0);
+  g.clearRect(0, 0, width, height);
+
+  const styles = getComputedStyle(document.documentElement);
+  const peakColor = styles.getPropertyValue("--peak").trim();
+  const rmsColor = styles.getPropertyValue("--rms").trim();
+  const gridColor = styles.getPropertyValue("--border").trim();
+  const mutedColor = styles.getPropertyValue("--muted").trim();
+
+  // The scale follows the loudest value on screen, so quiet devices are still readable.
+  const maxBlocks = Math.ceil((CHART_SECONDS * 1000) / blockMs);
+  let top = 0.02;
+  history.forEach((b) => (top = Math.max(top, b.peak)));
+  top *= 1.1;
+
+  g.strokeStyle = gridColor;
+  g.lineWidth = 1;
+  g.beginPath();
+  g.moveTo(0, height - 0.5);
+  g.lineTo(width, height - 0.5);
+  g.stroke();
+  g.fillStyle = mutedColor;
+  g.font = "11px system-ui, sans-serif";
+  g.fillText(`scale: 0 to ${top.toFixed(3)}`, 6, 14);
+
+  const drawLine = (key, color) => {
+    g.strokeStyle = color;
+    g.lineWidth = 1.5;
+    g.beginPath();
+    history.forEach((b, i) => {
+      const x = (i / (maxBlocks - 1)) * width;
+      const y = height - (b[key] / top) * (height - 4) - 2;
+      if (i === 0) g.moveTo(x, y); else g.lineTo(x, y);
+    });
+    g.stroke();
+  };
+  drawLine("peak", peakColor);
+  drawLine("rms", rmsColor);
+
+  const last = history[history.length - 1];
+  if (last) numbersText.textContent = `peak ${last.peak.toFixed(4)}   rms ${last.rms.toFixed(5)}`;
+
+  if (recording) {
+    const secondsLeft = (recording.blocksLeft * blockMs) / 1000;
+    recordingText.textContent = `Recording "${recording.label}" … ${secondsLeft.toFixed(1)} s`;
+  }
+
+  requestAnimationFrame(drawChart);
+}
+</script>
+</body>
+</html>
