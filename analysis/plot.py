@@ -1,10 +1,12 @@
 """
 Plots the recordings from the Audio Playground.
 
-Reads every CSV in the recordings folder, works out each device's background
-level from its "silence" segments, and draws:
+Reads every CSV in the recordings folder. Each file counts as one measurement,
+named after its file name (e.g. phone-chrome-quiet.csv -> "phone-chrome-quiet").
+The background level is worked out per file from its "silence" segments, or from
+the quietest 10 % of the file if it has none. Then it draws:
 
-  1. time_series.png  One row per device, one column per label.
+  1. time_series.png  One row per file, one column per label.
                       Every segment as RMS ratio over time (log scale).
   2. summary.png      Per segment: the loudest moment, once as absolute RMS
                       and once as ratio to the device's background.
@@ -32,9 +34,15 @@ def load_recordings(folder: Path) -> pd.DataFrame:
     files = sorted(folder.glob("*.csv"))
     if not files:
         sys.exit(f"No CSV files found in {folder}")
-    frames = [pd.read_csv(f) for f in files]
+    frames = []
+    for f in files:
+        frame = pd.read_csv(f)
+        # Each CSV file is one measurement: its file name (without .csv) is used as the
+        # row name in the plots, instead of the device name typed into the page.
+        frame["device"] = f.stem
+        frames.append(frame)
     data = pd.concat(frames, ignore_index=True)
-    print(f"Loaded {len(files)} file(s), {len(data)} rows, devices: {', '.join(data['device'].unique())}")
+    print(f"Loaded {len(files)} file(s), {len(data)} rows: {', '.join(f.stem for f in files)}")
     return data
 
 
@@ -69,8 +77,8 @@ def plot_time_series(data: pd.DataFrame, out: Path) -> None:
 
     fig, axes = plt.subplots(
         len(devices), len(labels),
-        figsize=(4 * len(labels), 2.8 * len(devices)),
-        squeeze=False, sharey=True
+        figsize=(4 * len(labels) + 1.5, 2.6 * len(devices) + 1),
+        squeeze=False, sharex=True, sharey=True
     )
 
     for r, device in enumerate(devices):
@@ -84,13 +92,16 @@ def plot_time_series(data: pd.DataFrame, out: Path) -> None:
             ax.set_yscale("log")
             ax.grid(True, which="both", alpha=0.25)
             if r == 0:
-                ax.set_title(label)
+                ax.set_title(label, fontsize=13, fontweight="bold")
             if c == 0:
-                ax.set_ylabel(f"{device}\nRMS / background")
-            if r == len(devices) - 1:
-                ax.set_xlabel("time in segment (s)")
+                # Device name as a row header, left of the plots
+                ax.set_ylabel(device, fontsize=12, fontweight="bold", rotation=0,
+                              ha="right", va="center", labelpad=12)
 
-    fig.suptitle("RMS as a multiple of each device's background (dashed line = background)")
+    # Axis descriptions once for the whole figure instead of in every row
+    fig.supxlabel("time in segment (s)")
+    fig.supylabel("RMS as a multiple of the background (log scale)", x=0.005)
+    fig.suptitle("Each recording relative to its device's background (dashed line = background)", fontsize=13)
     fig.tight_layout()
     fig.savefig(out, dpi=150)
     plt.close(fig)
@@ -106,22 +117,29 @@ def plot_summary(data: pd.DataFrame, out: Path) -> None:
     devices = sorted(per_segment["device"].unique())
     labels = ordered_labels(per_segment)
 
-    fig, (left, right) = plt.subplots(1, 2, figsize=(12, 4.5))
-    for ax, column, title in [
-        (left, "max_rms", "Loudest moment, absolute RMS"),
-        (right, "max_ratio", "Loudest moment, RMS / background"),
+    # Two panels on top of each other, so long device names have the full width
+    width = max(8, 1.4 * len(devices) + 3)
+    fig, (top, bottom) = plt.subplots(2, 1, figsize=(width, 8), sharex=True)
+    for ax, column, title, ylabel in [
+        (top, "max_rms", "Loudest moment per recording, absolute RMS", "RMS"),
+        (bottom, "max_ratio", "Loudest moment per recording, relative to the device's background", "RMS / background"),
     ]:
         for i, label in enumerate(labels):
             rows = per_segment[per_segment["label"] == label]
             offset = (i - (len(labels) - 1) / 2) * 0.15
             xs = [devices.index(d) + offset for d in rows["device"]]
-            ax.scatter(xs, rows[column], label=label, color=LABEL_COLORS.get(label, "#555555"), s=36, alpha=0.85)
-        ax.set_xticks(range(len(devices)))
-        ax.set_xticklabels(devices)
+            ax.scatter(xs, rows[column], label=label, color=LABEL_COLORS.get(label, "#555555"), s=40, alpha=0.85)
         ax.set_yscale("log")
-        ax.set_title(title)
+        ax.set_title(title, fontsize=12, loc="left")
+        ax.set_ylabel(ylabel)
         ax.grid(True, which="both", axis="y", alpha=0.25)
-    right.legend(loc="best")
+        # Light separators between devices
+        for x in range(1, len(devices)):
+            ax.axvline(x - 0.5, color="#dddddd", linewidth=0.8)
+
+    bottom.set_xticks(range(len(devices)))
+    bottom.set_xticklabels(devices, rotation=30, ha="right")
+    top.legend(loc="upper left", bbox_to_anchor=(1.01, 1), title="label")
 
     fig.tight_layout()
     fig.savefig(out, dpi=150)
